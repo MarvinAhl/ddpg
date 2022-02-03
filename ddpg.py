@@ -129,8 +129,8 @@ class ReplayBuffer:
 
 class DDPG:
     def __init__(self, state, actions, explore_factors=None, policy_hidden=(512, 512), value_hidden=(512, 512), gamma=0.99,
-                 learning_rate=0.0005, explore_start=0.5, explore_decay_steps=20000, explore_min=0.05,
-                 buffer_size_max=50000, buffer_size_min=1000, batch_size=64, replays=1, tau=0.01, device='cpu'):
+                 learning_rate=0.0002, explore_start=0.5, explore_decay_steps=20000, explore_min=0.05,
+                 buffer_size_max=50000, buffer_size_min=1024, batch_size=64, replays=1, tau=0.01, device='cpu'):
         """
         state: Integer of State Dimension
         actions: Integer of Number of Action
@@ -205,7 +205,7 @@ class DDPG:
         """
         with torch.no_grad():
             state = tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0)
-            actions = self.policy_net(state).squeeze().numpy()
+            actions = self.policy_net(state).squeeze().cpu().numpy()
 
         return actions
     
@@ -243,50 +243,37 @@ class DDPG:
             next_states = torch.from_numpy(next_states).to(self.device)
             terminals = torch.from_numpy(terminals).to(self.device)
 
-            qs = self.q_net(next_states)
-            target_qs = self.target_q_net(next_states)
+            # Q-Function training
+            next_actions = self.target_policy_net(next_states)
+            next_values = self.target_value_net(next_states, next_actions)
 
-            target_values = torch.empty((self.batch_size, len(self.actions)), device=self.device, dtype=torch.float32)
-            for i, (q, target_q) in enumerate(zip(qs, target_qs)):
-                max_actions = q.detach().argmax(-1).unsqueeze(-1)
-                max_action_qs = target_q.detach().gather(-1, max_actions).squeeze()
-                target_values[:, i] = max_action_qs
+            td_targets = rewards + self.gamma * next_values.detach() * (1 - terminals)
+            predictions = self.value_net(states, actions)
+            td_errors = td_targets - predictions
+            loss = td_errors.pow(2).mean()
 
-            mean_target_values = target_values.mean(-1)  # One Target for each 
-            targets = rewards + self.gamma * mean_target_values * (1 - terminals)
-
-            qs = self.q_net(states)
-            predictions = torch.empty((self.batch_size, len(self.actions)), device=self.device, dtype=torch.float32)
-            for i, q in enumerate(qs):
-                prediction = q.gather(-1, actions[:, i].unsqueeze(1)).squeeze()
-                predictions[:, i] = prediction
-
-            td_errors = targets.unsqueeze(1).expand_as(predictions) - predictions
-            weighted_td_errors = weights.unsqueeze(1).expand_as(td_errors) * td_errors  # PER Bias correction
-            loss = weighted_td_errors.pow(2).mean()  # Square Loss like in Paper
-
-            self.optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
             loss.backward()
+            self.value_optimizer.step()
 
-            # Gradient Rescaling of Shared Network part because all branches propagate gradients back through it
-            for i, param in enumerate(self.q_net.parameters()):
-                if i < len(self.shared) * 2:
-                    param.grad /= len(actions) + 1
+            # Policy Function training
+            pred_actions = self.policy_net(states)
+            pred_values = self.value_net(states, pred_actions)
+            loss = -pred_values.mean()
 
-            self.optimizer.step()
-
-            errors = td_errors.detach().abs().sum(-1).cpu().numpy()  # Sum of absolute TD Errors used for Replay Prioritization
-            self.buffer.update_experiences(indices, errors)  # Update replay buffer's temporal difference errors
+            self.policy_optimizer.zero_grad()
+            loss.backward()
+            self.policy_optimizer.step()
 
         self._update_targets(self.tau)
     
     def save_net(self, path):
-        torch.save(self.policy_net.state_dict(), 'policy' + path)
-        torch.save(self.value_net.state_dict(), 'value' + path)
+        torch.save(self.policy_net.state_dict(), 'policy_' + path)
+        torch.save(self.value_net.state_dict(), 'value_' + path)
     
     def load_net(self, path):
-        self.policy_net.load_state_dict(torch.load('policy' + path))
-        self.value_net.load_state_dict(torch.load('value' + path))
+        self.policy_net.load_state_dict(torch.load('policy_' + path))
+        self.value_net.load_state_dict(torch.load('value_' + path))
         self._update_target(1.0)  # Also load weights into target net
     
     def _update_targets(self, tau):
