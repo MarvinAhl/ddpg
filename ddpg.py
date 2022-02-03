@@ -72,45 +72,35 @@ class ValueNetwork(nn.Module):
 
 class ReplayBuffer:
     """
-    Prioritizing Replay Buffer
+    Uniformly random Replay Buffer
     """
-    def __init__(self, state, actions, max_len=50000, alpha=0.6, beta=0.1, beta_increase_steps=20000):
+    def __init__(self, state, actions, max_len=50000):
         """
-        state: Dimension of State
-        actions: Number of Actions
+        state: Integer of State Dimension
+        actions: Integer of Number of Actions
         """
         self.states = np.empty((max_len, state), dtype=np.float32)
-        self.actions = np.empty((max_len, actions), dtype=np.int64)
+        self.actions = np.empty((max_len, actions), dtype=np.float32)
         self.rewards = np.empty(max_len, dtype=np.float32)
         self.next_states = np.empty((max_len, state), dtype=np.float32)
         self.terminals = np.empty(max_len, dtype=np.int8)
-        self.errors = np.empty(max_len, dtype=np.float32)  # The Q-Network temporal difference error used for training
-        self.weights = np.empty(max_len, dtype=np.float32)  # Weights for gradient descend bias correction
-        self.probabilities = np.empty(max_len, dtype=np.float32)
 
         self.index = 0
         self.full = False
         self.max_len = max_len
         self.rng = np.random.default_rng()
-        self.probs_updated = False  # Indicates whether probabilities have to be recalculated
-        self.alpha = alpha  # Blend between uniform distribution (alpha = 0) and Probabilities according to rank (alpha = 1)
-        self.beta = beta  # Blend between full bias correction (beta = 1) and no bias correction (beta = 0)
-        self.beta_increase = (1.0 - beta) / beta_increase_steps  # Adder to linearly reach 1 within given amount of steps
     
     def store_experience(self, state, actions, reward, next_state, terminal):
         """
         Stores given SARS Experience in the Replay Buffer.
-        Returns True if the last element has been written into memory and
-        it will start over replacing the first elements at the next call.
+        Returns True if the last element has been written to memory and the
+        Buffer will start over replacing the first elements at next call.
         """
         self.states[self.index] = state
         self.actions[self.index] = actions
         self.rewards[self.index] = reward
         self.next_states[self.index] = next_state
         self.terminals[self.index] = terminal
-        self.errors[self.index] = 1.0 if self.__len__() == 0 else self.errors[:self.__len__()].max()  # To make it likely picked the first time
-
-        self.probs_updated = False
         
         self.index += 1
         self.index %= self.max_len  # Replace oldest Experiences if Buffer is full
@@ -119,78 +109,54 @@ class ReplayBuffer:
             self.full = True
             return True
         return False
-    
-    def update_experiences(self, indices, errors):
-        """
-        Update TD Errors for elements given by indices. Should be called after they have
-        been replayed and new errors were calculated. Errors have to be input as absolute values.
-        """
-        self.errors[indices] = errors
-        self.probs_updated = False
 
     def get_experiences(self, batch_size):
         """
         Returns batch of experiences for replay.
         """
-        buff_len = self.__len__()
-        
-        if not self.probs_updated:
-            sorted_indices = self.errors[:buff_len].argsort()[::-1]  # Indices from highest to lowest error
-            ranks = np.arange(buff_len)[sorted_indices] + 1
-            scaled_priorities = (1 / ranks)**self.alpha
-            
-            self.probabilities[:buff_len] = scaled_priorities / scaled_priorities.sum()
-            unnormed_weights = (self.probabilities[:buff_len] * buff_len)**-self.beta
-            self.weights[:buff_len] = unnormed_weights / unnormed_weights.max()
+        indices = self.rng.choice(self.__len__(), batch_size)
 
-            self.beta += self.beta_increase  # Update beta
-            self.beta = min(1.0, self.beta)
-
-            self.probs_updated = True
-
-        indices = self.rng.choice(np.arange(buff_len), batch_size, p=self.probabilities[:buff_len])
-
-        weights = self.weights[indices]
         states = self.states[indices]
         actions = self.actions[indices]
         rewards = self.rewards[indices]
         next_states = self.next_states[indices]
         terminals = self.terminals[indices]
 
-        return indices, weights, states, actions, rewards, next_states, terminals
+        return states, actions, rewards, next_states, terminals
 
     def __len__(self):
         return self.max_len if self.full else self.index
 
-class BDQ:
-    def __init__(self, state, actions, shared=(512, 512), branch=(128, 128), gamma=0.99, learning_rate=0.0005,
-                 weight_decay=0.0001, epsilon_start=1.0, epsilon_decay_steps=20000,
-                 epsilon_min=0.1, new_actions_prob=0.05, buffer_size_max=50000, buffer_size_min=1000,
-                 batch_size=64, replays=1, tau=0.01, alpha=0.6, beta=0.1, beta_increase_steps=50000, device='cpu'):
+class DDPG:
+    def __init__(self, state, actions, explore_factors=None, policy_hidden=(512, 512), value_hidden=(512, 512), gamma=0.99,
+                 learning_rate=0.0005, explore_start=0.5, explore_decay_steps=20000, explore_min=0.05,
+                 buffer_size_max=50000, buffer_size_min=1000, batch_size=64, replays=1, tau=0.01, device='cpu'):
         """
         state: Integer of State Dimension
-        actions: Tuple of Subactions per Action
+        actions: Integer of Number of Action
         """
         self.state = state
         self.actions = actions
-        self.shared = shared
-        self.branch = branch
-        self.q_net = Network(state, actions, shared, branch).to(device)
-        self.target_q_net = Network(state, actions, shared, branch).to(device)
-        self._update_target(1.0)  # Fully copy Online Net weights to Target Net
 
-        self.optimizer = torch.optim.RMSprop(self.q_net.parameters(),  # Using RMSProp because it's more stable, not as aggressive than Adam
-                                             lr=learning_rate, weight_decay=weight_decay)
-        self.weight_decay = weight_decay
+        self.policy_hidden = policy_hidden
+        self.policy_net = PolicyNetwork(state, actions, policy_hidden).to(device)
+        self.target_policy_net = PolicyNetwork(state, actions, policy_hidden).to(device)
+        
+        self.value_hidden = value_hidden
+        self.value_net = ValueNetwork(state, actions, value_hidden).to(device)
+        self.target_value_net = ValueNetwork(state, actions, value_hidden).to(device)
 
-        self.buffer = ReplayBuffer(state, len(actions), buffer_size_max, alpha, beta, beta_increase_steps)
+        self._update_targets(1.0)  # Fully copy Online Net weights to Target Net
+  
+        # Using RMSProp because it's more stable, not as aggressive than Adam
+        self.policy_optimizer = torch.optim.RMSprop(self.policy_net.parameters(), lr=learning_rate)
+        self.value_optimizer = torch.optim.RMSprop(self.value_net.parameters(), lr=learning_rate)
+
+        self.buffer = ReplayBuffer(state, actions, buffer_size_max)
         self.buffer_size_max = buffer_size_max
         self.buffer_size_min = buffer_size_min
         self.batch_size = batch_size
         self.replays = replays  # On how many batches it should train after each step
-        self.alpha = alpha
-        self.beta = beta
-        self.beta_increase_steps = beta_increase_steps
 
         # Can be calculated by exp(- dt / lookahead_horizon)
         self.gamma = gamma  # Reward discount rate
@@ -199,16 +165,16 @@ class BDQ:
 
         self.rng = np.random.default_rng()
 
-        # Linearly decay Epsilon from start to min in a given amount of steps
-        self.epsilon = epsilon_start
-        self.epsilon_start = epsilon_start
-        self.epsilon_decay = (epsilon_start - epsilon_min) / epsilon_decay_steps
-        self.epsilon_min = epsilon_min
+        if not explore_factors == None:
+            self.explore_factors = np.array(explore_factors, dtype=np.float32)
+        else:
+            self.explore_factors = np.ones(actions, dtype=np.float32)
 
-        # How many times per second on average a new action is chosen randomly (1 is regular e-greedy)
-        # Can be calculated by this formula: new_actions_per_second * dt
-        self.new_actions_prob = new_actions_prob
-        self.rand_actions = self.rng.integers(actions, dtype=np.int64)
+        # Linearly decay exploration rate from start to min in a given amount of steps
+        self.explore_rate = explore_start
+        self.explore_start = explore_start
+        self.explore_decay = (explore_start - explore_min) / explore_decay_steps
+        self.explore_min = explore_min
 
         self.tau = tau  # Mixing parameter for polyak averaging of target and online network
 
@@ -218,61 +184,48 @@ class BDQ:
         """
         Reset object to its initial state if you want to do multiple training passes with it
         """
-        self.q_net = Network(self.state, self.actions, self.shared, self.branch).to(self.device)
-        self.target_q_net = Network(self.state, self.actions, self.shared, self.branch).to(self.device)
-        self._update_target(1.0)  # Fully copy Online Net weights to Target Net
+        self.policy_net = PolicyNetwork(self.state, self.actions, self.policy_hidden).to(self.device)
+        self.target_policy_net = PolicyNetwork(self.state, self.actions, self.policy_hidden).to(self.device)
+        self.value_net = ValueNetwork(self.state, self.actions, self.value_hidden).to(self.device)
+        self.target_value_net = ValueNetwork(self.state, self.actions, self.value_hidden).to(self.device)
+        self._update_targets(1.0)  # Fully copy Online Net weights to Target Net
 
-        self.optimizer = torch.optim.RMSprop(self.q_net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        self.policy_optimizer = torch.optim.RMSprop(self.policy_net.parameters(), lr=self.learning_rate)
+        self.value_optimizer = torch.optim.RMSprop(self.value_net.parameters(), lr=self.learning_rate)
 
-        self.buffer = ReplayBuffer(self.state, len(self.actions), self.buffer_size_max, self.alpha, self.beta, self.beta_increase_steps)
+        self.buffer = ReplayBuffer(self.state, self.actions, self.buffer_size_max)
 
-        self.epsilon = self.epsilon_start
+        self.explore_rate = self.explore_start
 
         self.rng = np.random.default_rng()
-    
+
     def act(self, state):
         """
-        Decides on action based on current state using epsilon-greedy Policy.
-        Choses if action is random for each action individually.
-        Random actions are correlated though. Every time there is a chance that
-        the random actions from last time are used again.
+        Decides on action based on current state using Policy Net.
         """
-        actions = self.act_optimally(state)  # Greedy actions
+        with torch.no_grad():
+            state = tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0)
+            actions = self.policy_net(state).squeeze().numpy()
 
-        is_rand = self.rng.random(len(self.actions)) < self.epsilon  # List of Booleans indicating which actions will be random
-
-        probs_new = self.new_actions_prob / self.epsilon  # Probability for new random action
-        is_new = self.rng.random(len(self.actions)) < probs_new  # List of Booleans indicating which random actions will be exchanged by new ones
-
-        self.rand_actions[is_rand * is_new] = self.rng.integers(self.actions, dtype=np.int64)[is_rand * is_new]  # Generate new random actions
-
-        actions[is_rand] = self.rand_actions[is_rand]  # Make some actions random
+        return actions
+    
+    def act_explore(self, state):
+        """
+        Decides on action but adds Gaussian Noise for exploratory purposes.
+        """
+        actions = self.act(state)  # Optimal actions
+        explore_actions = self.rng.normal(actions, self.explore_factors * self.explore_rate)
+        explore_actions_clip = np.clip(explore_actions, -1.0, 1.0)
 
         self._update_parameters()
 
-        return actions
-
-    def act_optimally(self, state):
-        """
-        Decides on action based on current state using greedy Policy.
-        """
-        state = tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0)
-        qs = self.q_net(state)
-
-        actions = np.empty(len(self.actions), dtype=np.int64)
-        for i, q in enumerate(qs):
-            actions[i] = q.detach().unsqueeze(0).argmax().item()
-
-        return actions
+        return explore_actions_clip
     
-    def experience(self, state, action, reward, next_state, terminal):
+    def experience(self, state, actions, reward, next_state, terminal):
         """
         Takes experience and stores it for replay.
         """
-        if self.buffer.store_experience(state, action, reward, next_state, terminal):
-            # Reset exploration rate when Replay Buffer is full to always have
-            # negative Experiences in storage. Will prevent catastrophic forgetting
-            self.epsilon = self.epsilon_start  
+        self.buffer.store_experience(state, actions, reward, next_state, terminal)
     
     def train(self):
         """
@@ -282,9 +235,8 @@ class BDQ:
             return  # Dont train until Replay Buffer has collected a certain number of initial experiences
 
         for _ in range(self.replays):
-            indices, weights, states, actions, rewards, next_states, terminals = self.buffer.get_experiences(self.batch_size)
+            states, actions, rewards, next_states, terminals = self.buffer.get_experiences(self.batch_size)
 
-            weights = torch.from_numpy(weights).to(self.device)
             states = torch.from_numpy(states).to(self.device)
             rewards = torch.from_numpy(rewards).to(self.device)
             actions = torch.from_numpy(actions).to(self.device)
@@ -326,26 +278,31 @@ class BDQ:
             errors = td_errors.detach().abs().sum(-1).cpu().numpy()  # Sum of absolute TD Errors used for Replay Prioritization
             self.buffer.update_experiences(indices, errors)  # Update replay buffer's temporal difference errors
 
-        self._update_target(self.tau)
+        self._update_targets(self.tau)
     
     def save_net(self, path):
-        torch.save(self.q_net.state_dict(), path)
+        torch.save(self.policy_net.state_dict(), 'policy' + path)
+        torch.save(self.value_net.state_dict(), 'value' + path)
     
     def load_net(self, path):
-        self.q_net.load_state_dict(torch.load(path))
+        self.policy_net.load_state_dict(torch.load('policy' + path))
+        self.value_net.load_state_dict(torch.load('value' + path))
         self._update_target(1.0)  # Also load weights into target net
     
-    def _update_target(self, tau):
+    def _update_targets(self, tau):
         """
-        Update Target Network by blending Target und Online Network weights using the factor tau (Polyak Averaging)
+        Update Target Networks by blending Target und Online Network weights using the factor tau (Polyak Averaging)
         A tau of 1 just copies the whole online network over to the target network
         """
-        for param, target_param in zip(self.q_net.parameters(), self.target_q_net.parameters()):
-            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+        for policy_param, target_policy_param in zip(self.policy_net.parameters(), self.target_policy_net.parameters()):
+            target_policy_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_policy_param.data)
+        
+        for value_param, target_value_param in zip(self.value_net.parameters(), self.target_value_net.parameters()):
+            target_value_param.data.copy_(tau * value_param.data + (1.0 - tau) * target_value_param.data)
     
     def _update_parameters(self):
         """
         Decay epsilon
         """
-        self.epsilon -= self.epsilon_decay
-        self.epsilon = max(self.epsilon, self.epsilon_min)
+        self.explore_rate -= self.explore_decay
+        self.explore_rate = max(self.explore_rate, self.explore_min)
